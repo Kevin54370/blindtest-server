@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Animateur - BlindTest Pro</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="card">
+  <h1>Console animateur</h1>
+
+  <section id="create">
+    <input id="desiredCode" inputmode="numeric" maxlength="12" placeholder="Code personnalisé (optionnel)">
+    <button class="primary" id="createBtn">CRÉER UNE PARTIE</button>
+  </section>
+
+  <section id="panel" hidden>
+    <p class="subtitle">Code partie</p>
+    <div class="winner" id="roomCode"></div>
+
+    <p class="small" id="joinUrl"></p>
+
+    <div class="winner" id="winner">En attente d'un buzz…</div>
+
+    <div class="row">
+      <button class="primary" id="resetBtn">NOUVEAU BUZZ</button>
+      <button id="lockBtn">VERROUILLER</button>
+    </div>
+
+    <h3>Joueurs connectés</h3>
+    <ul class="players" id="players"></ul>
+  </section>
+</main>
+
+<script>
+const createBtn = document.getElementById("createBtn");
+const desiredCode = document.getElementById("desiredCode");
+const create = document.getElementById("create");
+const panel = document.getElementById("panel");
+const roomCode = document.getElementById("roomCode");
+const joinUrl = document.getElementById("joinUrl");
+const winner = document.getElementById("winner");
+const players = document.getElementById("players");
+const resetBtn = document.getElementById("resetBtn");
+const lockBtn = document.getElementById("lockBtn");
+
+let ws = null;
+let pingTimer = null;
+let room = null;
+
+function wsBase() {
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+}
+
+function connectHost(code) {
+  room = code;
+  ws = new WebSocket(`${wsBase()}/ws/host/${encodeURIComponent(code)}`);
+
+  ws.onopen = () => {
+    create.hidden = true;
+    panel.hidden = false;
+    roomCode.textContent = code;
+    joinUrl.textContent = `${location.origin}/play?room=${encodeURIComponent(code)}`;
+
+    pingTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type:"ping"}));
+      }
+    }, 25000);
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === "state") {
+      renderPlayers(msg.players || []);
+      if (msg.winner?.name) {
+        winner.textContent = `🏆 ${msg.winner.name}`;
+      } else if (!msg.locked) {
+        winner.textContent = "En attente d'un buzz…";
+      }
+    }
+
+    if (msg.type === "buzz") {
+      winner.textContent = `🏆 ${msg.winner.name}`;
+    }
+
+    if (msg.type === "reset") {
+      winner.textContent = "En attente d'un buzz…";
+    }
+  };
+
+  ws.onclose = () => {
+    clearInterval(pingTimer);
+    winner.textContent = "Connexion serveur interrompue";
+  };
+}
+
+function renderPlayers(list) {
+  players.innerHTML = "";
+  for (const p of list) {
+    const li = document.createElement("li");
+    li.textContent = p.name;
+    players.appendChild(li);
+  }
+  if (!list.length) {
+    const li = document.createElement("li");
+    li.textContent = "Aucun joueur connecté";
+    players.appendChild(li);
+  }
+}
+
+createBtn.onclick = async () => {
+  const body = {};
+  const code = desiredCode.value.trim();
+  if (code) body.code = code;
+
+  const response = await fetch("/api/rooms", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    alert(err.detail || "Impossible de créer la partie.");
+    return;
+  }
+
+  const data = await response.json();
+  connectHost(data.room);
+};
+
+resetBtn.onclick = () => {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type:"reset"}));
+  }
+};
+
+lockBtn.onclick = () => {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type:"lock"}));
+    winner.textContent = "Buzzers verrouillés";
+  }
+};
+</script>
+</body>
+</html>

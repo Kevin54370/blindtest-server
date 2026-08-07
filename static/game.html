@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+  <title>Buzzer - BlindTest Pro</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="card">
+    <h1>BlindTest Pro</h1>
+
+    <section id="join">
+      <input id="room" inputmode="numeric" maxlength="12" placeholder="Code partie">
+      <input id="name" maxlength="30" placeholder="Votre pseudo">
+      <button class="primary" id="joinBtn">REJOINDRE</button>
+    </section>
+
+    <section id="game" hidden>
+      <p class="subtitle">Partie <strong id="roomLabel"></strong></p>
+      <button class="buzzer" id="buzzBtn">BUZZ</button>
+      <div class="status" id="status">Prêt à buzzer !</div>
+    </section>
+  </main>
+
+<script>
+const roomInput = document.getElementById("room");
+const nameInput = document.getElementById("name");
+const joinBtn = document.getElementById("joinBtn");
+const join = document.getElementById("join");
+const game = document.getElementById("game");
+const buzzBtn = document.getElementById("buzzBtn");
+const statusBox = document.getElementById("status");
+const roomLabel = document.getElementById("roomLabel");
+
+const params = new URLSearchParams(location.search);
+if (params.get("room")) roomInput.value = params.get("room");
+
+let ws = null;
+let pingTimer = null;
+
+function wsBase() {
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+}
+
+function setStatus(text) {
+  statusBox.textContent = text;
+}
+
+joinBtn.onclick = () => {
+  const room = roomInput.value.trim().toUpperCase();
+  const name = nameInput.value.trim();
+
+  if (!room || !name) {
+    alert("Entre le code de partie et ton pseudo.");
+    return;
+  }
+
+  ws = new WebSocket(`${wsBase()}/ws/player/${encodeURIComponent(room)}/${encodeURIComponent(name)}`);
+
+  ws.onopen = () => {
+    join.hidden = true;
+    game.hidden = false;
+    roomLabel.textContent = room;
+    buzzBtn.disabled = false;
+    setStatus("Connecté — prêt à buzzer !");
+    pingTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type:"ping"}));
+      }
+    }, 25000);
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === "buzz") {
+      buzzBtn.disabled = true;
+      if (msg.winner?.name === name) {
+        setStatus("🏆 TU AS BUZZÉ EN PREMIER !");
+        if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
+      } else {
+        setStatus(`⛔ ${msg.winner?.name || "Un joueur"} a buzzé en premier`);
+      }
+    }
+
+    if (msg.type === "buzz_rejected") {
+      buzzBtn.disabled = true;
+      setStatus(`⛔ ${msg.winner?.name || "Un joueur"} a déjà buzzé`);
+    }
+
+    if (msg.type === "reset") {
+      buzzBtn.disabled = false;
+      setStatus("Prêt à buzzer !");
+    }
+
+    if (msg.type === "room_closed") {
+      buzzBtn.disabled = true;
+      setStatus("Partie terminée.");
+    }
+  };
+
+  ws.onclose = (event) => {
+    clearInterval(pingTimer);
+    buzzBtn.disabled = true;
+    if (game.hidden) {
+      alert("Impossible de rejoindre cette partie. Vérifie le code.");
+    } else {
+      setStatus("Connexion au serveur interrompue.");
+    }
+  };
+};
+
+buzzBtn.onclick = () => {
+  if (ws && ws.readyState === WebSocket.OPEN && !buzzBtn.disabled) {
+    buzzBtn.disabled = true;
+    setStatus("Buzz envoyé…");
+    ws.send(JSON.stringify({type:"buzz"}));
+  }
+};
+</script>
+</body>
+</html>
