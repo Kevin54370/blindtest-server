@@ -52,7 +52,8 @@ let currentRoom = "";
 let currentName = "";
 let savedPlayerId = "";
 let wakeLock = null;
-let wakeRequested = false;\nlet lastPongAt = Date.now();
+let wakeRequested = false;\n
+let lastPongAt = Date.now();
 
 function wsBase() {
   return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
