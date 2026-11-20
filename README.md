@@ -1,84 +1,21 @@
-# BlindTest Server
+# BlindTestPro V3.1.2 — Serveur Render
 
-Serveur Internet léger pour Blind Test Pro.
-
-## Fonctions
-- FastAPI
-- WebSockets
-- salons de jeu
-- pseudos joueurs
-- premier buzz verrouillé côté serveur
-- remise à zéro par l'animateur
-- page mobile joueur
-- page animateur de test
-- endpoint `/health`
-- configuration Render incluse
+## Nouveautés
+- Wake Lock du navigateur pour empêcher la mise en veille de l'écran pendant la partie, si le navigateur et le téléphone le prennent en charge.
+- Reconnexion WebSocket automatique avec délai progressif.
+- Conservation locale du pseudo et de l'identifiant joueur (`localStorage`).
+- Le serveur reprend l'inscription existante grâce à l'identifiant joueur.
+- Une coupure temporaire ne supprime plus immédiatement le joueur : son inscription est conservée 2 heures.
+- Les joueurs déconnectés restent visibles comme « Déconnecté » dans l'interface animateur.
 
 ## Déploiement Render
+1. Décompresser cette archive.
+2. Remplacer les fichiers du dépôt GitHub `blindtest-server` par le contenu du dossier.
+3. Commit / push sur la branche suivie par Render.
+4. Attendre le redéploiement puis vérifier `https://VOTRE-SERVEUR/health`.
 
-1. Créer un dépôt GitHub `blindtest-server`.
-2. Envoyer tous les fichiers de ce projet à la racine du dépôt.
-3. Dans Render : **New > Web Service**.
-4. Connecter le dépôt GitHub.
-5. Render détectera `render.yaml`, ou utiliser :
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-6. Déployer.
-
-## Test
-
-Une fois déployé :
-
-- `/` : accueil
-- `/host` : interface animateur de test
-- `/play` : interface joueur
-- `/health` : état du serveur
-
-### Exemple
-
-1. Ouvrir `/host`.
-2. Créer une partie.
-3. Copier le code.
-4. Sur un téléphone, ouvrir `/play?room=1234`.
-5. Entrer un pseudo.
-6. Buzzer.
-7. Le premier buzz s'affiche sur l'écran animateur.
-
-## API
-
-### Créer un salon
-
-`POST /api/rooms`
-
-Corps optionnel :
-
-```json
-{"code":"1234"}
-```
-
-### WebSocket joueur
-
-`/ws/player/{room}/{name}`
-
-Le joueur envoie :
-
-```json
-{"type":"buzz"}
-```
-
-### WebSocket animateur
-
-`/ws/host/{room}`
-
-Commandes :
-
-```json
-{"type":"reset"}
-{"type":"lock"}
-{"type":"unlock"}
-{"type":"ping"}
-```
-
-## Remarque
-
-Cette version conserve les salons en mémoire. C'est adapté à un premier déploiement Render et à une soirée Blind Test. Si le service redémarre, les salons en cours sont perdus.
+## Limites à connaître
+- Wake Lock fonctionne surtout sur les navigateurs mobiles récents en HTTPS. Le téléphone peut malgré tout suspendre une page si le système l'impose.
+- Dans ce cas, la reconnexion automatique reprend la même identité au retour dans la page.
+- Les salons et les identifiants sont stockés en mémoire sur le processus Render. Un redémarrage complet du serveur efface les salons en cours ; pour une persistance après redémarrage, il faudrait ajouter une base de données.
+- L'identité locale est conservée sur le même navigateur et le même téléphone. Effacer les données du navigateur ou changer d'appareil fait perdre ce jeton local.

@@ -3,23 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+  <meta name="theme-color" content="#111827">
   <title>Buzzer - BlindTest Pro</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <main class="card">
     <h1>BlindTest Pro</h1>
+    <p class="subtitle">Inscription individuelle — un téléphone par joueur</p>
 
     <section id="join">
       <input id="room" inputmode="numeric" maxlength="12" placeholder="Code partie">
-      <input id="name" maxlength="30" placeholder="Votre pseudo">
+      <input id="name" maxlength="30" placeholder="Votre prénom ou pseudo" autocomplete="nickname">
       <button class="primary" id="joinBtn">REJOINDRE</button>
     </section>
 
     <section id="game" hidden>
       <p class="subtitle">Partie <strong id="roomLabel"></strong></p>
+      <p class="small" id="connectionState" role="status">Connexion…</p>
       <button class="buzzer" id="buzzBtn">BUZZ</button>
-      <div class="status" id="status">Prêt à buzzer !</div>
+      <div class="status" id="status">Connexion au serveur…</div>
+      <p class="small" id="wakeState">Maintien de l’écran actif en préparation…</p>
     </section>
   </main>
 
@@ -32,83 +36,234 @@ const game = document.getElementById("game");
 const buzzBtn = document.getElementById("buzzBtn");
 const statusBox = document.getElementById("status");
 const roomLabel = document.getElementById("roomLabel");
+const connectionState = document.getElementById("connectionState");
+const wakeState = document.getElementById("wakeState");
 
 const params = new URLSearchParams(location.search);
 if (params.get("room")) roomInput.value = params.get("room");
 
 let ws = null;
 let pingTimer = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+let manuallyClosed = false;
+let hasJoined = false;
+let currentRoom = "";
+let currentName = "";
+let savedPlayerId = "";
+let wakeLock = null;
+let wakeRequested = false;\nlet lastPongAt = Date.now();
 
 function wsBase() {
   return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
 }
-
 function setStatus(text) {
   statusBox.textContent = text;
 }
+function storageKey(room) {
+  return `blindtest-player-${room}`;
+}
+function loadSavedPlayer(room) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey(room)) || "null");
+    if (saved && typeof saved.name === "string" && typeof saved.player_id === "string") {
+      return saved;
+    }
+  } catch (_) {}
+  return null;
+}
+function savePlayer(room, name, playerId) {
+  try {
+    localStorage.setItem(storageKey(room), JSON.stringify({name, player_id: playerId}));
+  } catch (_) {}
+}
+async function requestWakeLock() {
+  wakeRequested = true;
+  if (!("wakeLock" in navigator)) {
+    wakeState.textContent = "Écran actif : non pris en charge par ce navigateur. Désactive la veille automatique du téléphone pendant la partie.";
+    return;
+  }
+  try {
+    if (wakeLock && !wakeLock.released) return;
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeState.textContent = "☀️ Écran maintenu actif pendant la partie.";
+    wakeLock.addEventListener("release", () => {
+      wakeState.textContent = "Écran libéré. Il sera réactivé au retour dans la page.";
+    });
+  } catch (err) {
+    wakeState.textContent = "Maintien d’écran refusé par le téléphone. Garde la page visible et désactive temporairement la veille.";
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (wakeRequested) requestWakeLock();
+    if (hasJoined && (!ws || ws.readyState === WebSocket.CLOSED)) scheduleReconnect(300);
+  }
+});
+window.addEventListener("pageshow", () => {
+  if (wakeRequested) requestWakeLock();
+});
+window.addEventListener("online", () => {
+  if (hasJoined) scheduleReconnect(250);
+});
+window.addEventListener("offline", () => {
+  if (hasJoined) connectionState.textContent = "Réseau indisponible — reconnexion dès le retour d’Internet…";
+});
 
-joinBtn.onclick = () => {
-  const room = roomInput.value.trim().toUpperCase();
-  const name = nameInput.value.trim();
+function clearSocketTimers() {
+  if (pingTimer) clearInterval(pingTimer);
+  pingTimer = null;
+}
+function scheduleReconnect(delay = reconnectDelay) {
+  if (!hasJoined || manuallyClosed || reconnectTimer) return;
+  connectionState.textContent = "Connexion interrompue — reconnexion automatique…";
+  buzzBtn.disabled = true;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectPlayer();
+  }, delay);
+  reconnectDelay = Math.min(Math.round(reconnectDelay * 1.7), 15000);
+}
+function connectPlayer() {
+  if (!hasJoined || manuallyClosed) return;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
 
-  if (!room || !name) {
-    alert("Entre le code de partie et ton pseudo.");
+  clearSocketTimers();
+  connectionState.textContent = savedPlayerId ? "Récupération de votre inscription…" : "Connexion au serveur…";
+  let url = `${wsBase()}/ws/player/${encodeURIComponent(currentRoom)}/${encodeURIComponent(currentName)}`;
+  if (savedPlayerId) url += `?player_id=${encodeURIComponent(savedPlayerId)}`;
+
+  try {
+    ws = new WebSocket(url);
+  } catch (_) {
+    scheduleReconnect();
     return;
   }
 
-  ws = new WebSocket(`${wsBase()}/ws/player/${encodeURIComponent(room)}/${encodeURIComponent(name)}`);
-
-  ws.onopen = () => {
-    join.hidden = true;
-    game.hidden = false;
-    roomLabel.textContent = room;
-    buzzBtn.disabled = false;
-    setStatus("Connecté — prêt à buzzer !");
+  const thisSocket = ws;
+  thisSocket.onopen = () => {
+    reconnectDelay = 1000;
+    lastPongAt = Date.now();
+    connectionState.textContent = "Serveur connecté";
     pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({type:"ping"}));
+      if (thisSocket.readyState === WebSocket.OPEN) {
+        // Détecter une socket « fantôme » après la veille du téléphone.
+        if (Date.now() - lastPongAt > 45000) {
+          thisSocket.close();
+          return;
+        }
+        thisSocket.send(JSON.stringify({type:"ping"}));
       }
-    }, 25000);
+    }, 15000);
   };
 
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
+  thisSocket.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (_) { return; }
 
+    if (msg.type === "pong") {
+      lastPongAt = Date.now();
+      return;
+    }
+
+    if (msg.type === "welcome") {
+      savedPlayerId = msg.player_id || savedPlayerId;
+      savePlayer(currentRoom, currentName, savedPlayerId);
+      join.hidden = true;
+      game.hidden = false;
+      roomLabel.textContent = currentRoom;
+      connectionState.textContent = msg.reconnected ? "Reconnecté — inscription récupérée" : "Inscription confirmée";
+      if (msg.locked) {
+        buzzBtn.disabled = true;
+        setStatus(msg.winner?.name ? `⛔ ${msg.winner.name} a déjà buzzé` : "Buzzers verrouillés");
+      } else {
+        buzzBtn.disabled = false;
+        setStatus(msg.reconnected ? "Tu es de retour ! Prêt à buzzer." : `Inscription confirmée pour ${currentName} — prêt à buzzer !`);
+      }
+      requestWakeLock();
+      return;
+    }
+
+    if (msg.type === "state") {
+      if (msg.locked) {
+        buzzBtn.disabled = true;
+        if (msg.winner?.name) setStatus(`⛔ ${msg.winner.name} a buzzé en premier`);
+      } else if (ws === thisSocket && thisSocket.readyState === WebSocket.OPEN) {
+        buzzBtn.disabled = false;
+      }
+    }
     if (msg.type === "buzz") {
       buzzBtn.disabled = true;
-      if (msg.winner?.name === name) {
+      if (msg.winner?.player_id === savedPlayerId) {
         setStatus("🏆 TU AS BUZZÉ EN PREMIER !");
         if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
       } else {
         setStatus(`⛔ ${msg.winner?.name || "Un joueur"} a buzzé en premier`);
       }
     }
-
     if (msg.type === "buzz_rejected") {
       buzzBtn.disabled = true;
       setStatus(`⛔ ${msg.winner?.name || "Un joueur"} a déjà buzzé`);
     }
-
     if (msg.type === "reset") {
       buzzBtn.disabled = false;
       setStatus("Prêt à buzzer !");
     }
-
     if (msg.type === "room_closed") {
       buzzBtn.disabled = true;
+      manuallyClosed = true;
       setStatus("Partie terminée.");
+      connectionState.textContent = "Partie fermée";
     }
   };
 
-  ws.onclose = (event) => {
-    clearInterval(pingTimer);
-    buzzBtn.disabled = true;
-    if (game.hidden) {
-      alert("Impossible de rejoindre cette partie. Vérifie le code.");
-    } else {
-      setStatus("Connexion au serveur interrompue.");
-    }
+  thisSocket.onerror = () => {
+    connectionState.textContent = "Erreur de connexion — nouvelle tentative…";
   };
+  thisSocket.onclose = (event) => {
+    clearSocketTimers();
+    // Une ancienne socket remplacée ne doit pas déclencher une seconde reconnexion.
+    if (ws !== thisSocket) return;
+    ws = null;
+    if (!hasJoined || manuallyClosed) {
+      if (!game.hidden) {
+        buzzBtn.disabled = true;
+        connectionState.textContent = "Connexion fermée";
+      }
+      return;
+    }
+    if (event.code === 4404) {
+      manuallyClosed = true;
+      connectionState.textContent = "Partie introuvable ou serveur redémarré.";
+      setStatus("La partie n’est plus disponible. Demande un nouveau QR Code à l’animateur.");
+      return;
+    }
+    scheduleReconnect();
+  };
+}
+
+joinBtn.onclick = async () => {
+  currentRoom = roomInput.value.trim().toUpperCase();
+  currentName = nameInput.value.trim();
+  if (!currentRoom || !currentName) {
+    alert("Entre le code de partie et ton prénom ou pseudo.");
+    return;
+  }
+  const saved = loadSavedPlayer(currentRoom);
+  if (saved && saved.name === currentName) savedPlayerId = saved.player_id;
+  else savedPlayerId = "";
+
+  hasJoined = true;
+  manuallyClosed = false;
+  reconnectDelay = 1000;
+  joinBtn.disabled = true;
+  joinBtn.textContent = "CONNEXION…";
+  await requestWakeLock(); // déclenché directement par l’action du joueur
+  game.hidden = false;
+  join.hidden = true;
+  roomLabel.textContent = currentRoom;
+  setStatus("Connexion au serveur…");
+  connectPlayer();
 };
 
 buzzBtn.onclick = () => {

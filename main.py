@@ -10,10 +10,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="BlindTest Pro Server", version="1.0.0")
+app = FastAPI(title="BlindTest Pro Server", version="1.2.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+PLAYER_GRACE_SECONDS = 2 * 60 * 60  # 2 heures pour retrouver le même joueur
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -21,6 +22,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 class Room:
     def __init__(self, code: str):
         self.code = code
+        # Les joueurs déconnectés sont conservés temporairement pour permettre
+        # une reconnexion avec le même identifiant et conserver leur score côté animateur.
         self.players: Dict[str, dict] = {}
         self.hosts: Dict[str, WebSocket] = {}
         self.locked = False
@@ -35,7 +38,11 @@ class Room:
             "locked": self.locked,
             "winner": self.winner,
             "players": [
-                {"id": pid, "name": p["name"], "connected": True}
+                {
+                    "id": pid,
+                    "name": p["name"],
+                    "connected": p.get("ws") is not None,
+                }
                 for pid, p in self.players.items()
             ],
         }
@@ -70,21 +77,19 @@ async def send_json_safe(ws: WebSocket, data: dict):
 
 
 async def broadcast(room: Room, data: dict):
-    dead_players = []
-    for pid, player in list(room.players.items()):
-        if not await send_json_safe(player["ws"], data):
-            dead_players.append(pid)
+    # Ne pas supprimer une inscription parce qu'un téléphone est temporairement
+    # endormi ou inaccessible. La fermeture sera traitée par son propre handler.
+    for player in list(room.players.values()):
+        ws = player.get("ws")
+        if ws is not None:
+            if not await send_json_safe(ws, data):
+                if player.get("ws") is ws:
+                    player["ws"] = None
+                    player["disconnected_at"] = time.time()
 
-    for pid in dead_players:
-        room.players.pop(pid, None)
-
-    dead_hosts = []
     for hid, ws in list(room.hosts.items()):
         if not await send_json_safe(ws, data):
-            dead_hosts.append(hid)
-
-    for hid in dead_hosts:
-        room.hosts.pop(hid, None)
+            room.hosts.pop(hid, None)
 
 
 async def broadcast_state(room: Room):
@@ -140,7 +145,7 @@ async def delete_room(code: str):
 
 
 @app.websocket("/ws/player/{code}/{name}")
-async def player_ws(websocket: WebSocket, code: str, name: str):
+async def player_ws(websocket: WebSocket, code: str, name: str, player_id: Optional[str] = None):
     code = normalize_room(code)
     name = name.strip()[:30] or "Joueur"
 
@@ -151,19 +156,39 @@ async def player_ws(websocket: WebSocket, code: str, name: str):
 
     await websocket.accept()
 
-    player_id = secrets.token_hex(6)
-    room.players[player_id] = {
-        "name": name,
-        "ws": websocket,
-        "connected_at": time.time(),
-    }
+    # Reprendre l'inscription existante si le navigateur a conservé son identifiant.
+    player = room.players.get(player_id) if player_id else None
+    if player is None:
+        player_id = secrets.token_hex(12)
+        player = {
+            "name": name,
+            "ws": websocket,
+            "connected_at": time.time(),
+            "disconnected_at": None,
+        }
+        room.players[player_id] = player
+    else:
+        previous_ws = player.get("ws")
+        player["name"] = name or player["name"]
+        player["ws"] = websocket
+        player["disconnected_at"] = None
+        # Une ancienne socket peut être restée ouverte si le réseau a basculé.
+        if previous_ws is not None and previous_ws is not websocket:
+            try:
+                await previous_ws.close(code=4001, reason="Reconnected on another connection")
+            except Exception:
+                pass
 
     await websocket.send_json({
         "type": "welcome",
         "player_id": player_id,
         "room": code,
-        "name": name,
+        "name": player["name"],
+        "reconnected": bool(player.get("connected_at") and player.get("disconnected_at") is None and player.get("ever_connected", False)),
+        "locked": room.locked,
+        "winner": room.winner,
     })
+    player["ever_connected"] = True
     await broadcast_state(room)
 
     try:
@@ -173,10 +198,12 @@ async def player_ws(websocket: WebSocket, code: str, name: str):
 
             if msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
-                continue
 
-            if msg_type == "buzz":
+            elif msg_type == "buzz":
                 async with room.lock:
+                    # Ignorer les messages d'une ancienne connexion remplacée.
+                    if room.players.get(player_id, {}).get("ws") is not websocket:
+                        continue
                     if room.locked:
                         await websocket.send_json({
                             "type": "buzz_rejected",
@@ -187,19 +214,26 @@ async def player_ws(websocket: WebSocket, code: str, name: str):
                     room.locked = True
                     room.winner = {
                         "player_id": player_id,
-                        "name": name,
+                        "name": player["name"],
                         "timestamp": time.time(),
                     }
                     await broadcast(room, {
                         "type": "buzz",
                         "winner": room.winner,
                     })
+                    await broadcast_state(room)
 
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
     finally:
-        room.players.pop(player_id, None)
-        await broadcast_state(room)
+        # Ne pas marquer hors ligne la nouvelle socket si l'ancienne se ferme.
+        current = room.players.get(player_id)
+        if current is not None and current.get("ws") is websocket:
+            current["ws"] = None
+            current["disconnected_at"] = time.time()
+            await broadcast_state(room)
 
 
 @app.websocket("/ws/host/{code}")
@@ -258,8 +292,18 @@ async def host_ws(websocket: WebSocket, code: str):
 async def cleanup_task_startup():
     async def cleanup():
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
             now = time.time()
+            for room in list(rooms.values()):
+                expired = [
+                    pid for pid, player in room.players.items()
+                    if player.get("ws") is None
+                    and player.get("disconnected_at") is not None
+                    and now - player["disconnected_at"] > PLAYER_GRACE_SECONDS
+                ]
+                for pid in expired:
+                    room.players.pop(pid, None)
+
             stale = [
                 code for code, room in rooms.items()
                 if not room.players
